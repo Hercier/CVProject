@@ -53,8 +53,7 @@ class InfoDrop(Attack):
         self.q_tables = {"y": torch.from_numpy(q_ini_table),
                         "cb": torch.from_numpy(q_ini_table),
                         "cr": torch.from_numpy(q_ini_table)}        
-        self.optimizer = torch.optim.Adam([self.q_tables["y"],  self.q_tables["cb"], self.q_tables["cr"]], lr= 0.01)
-    
+        
      
     def forward(self, images, labels):
         r"""
@@ -143,7 +142,7 @@ class UniDrop(Attack):
         
     """
     def __init__(self, model, height = 224, width = 224,  steps=40, batch_size = 20, block_size = 8, q_size = 10, targeted = False):
-        super(InfoDrop, self).__init__("InfoDrop", model)
+        super(UniDrop, self).__init__("UniDrop", model)
         self.steps = steps
         self.targeted = targeted
         self.batch_size = batch_size
@@ -152,10 +151,10 @@ class UniDrop(Attack):
         # Value for quantization range
         self.factor_range = [5, q_size]
         # Differential quantization
-        self.alpha_range = [0.1, 1e-20]
+        self.alpha_range = [float(np.log(0.1)), float(np.log(1e-20))]
         self.alpha = torch.tensor(self.alpha_range[0])
-        self.alpha_interval = torch.tensor(np.exp(np.log(self.alpha_range[1] - self.alpha_range[0])/ self.steps))
-        block_n = np.ceil(height / block_size) * np.ceil(height / block_size) 
+        self.alpha_interval = torch.tensor(self.alpha_range[1] - self.alpha_range[0])/ self.steps
+        block_n = np.ceil(height / block_size) * np.ceil(width / block_size) 
         self.alpha = self.alpha.to(self.device)
         self.alpha_interval = self.alpha_interval.to(self.device)
         q_ini_table = np.empty((int(block_n),block_size,block_size), dtype = np.float32)
@@ -166,9 +165,10 @@ class UniDrop(Attack):
         self.q_tables["y"].requires_grad = True
         self.q_tables["cb"].requires_grad = True
         self.q_tables["cr"].requires_grad = True
+        self.optimizer = torch.optim.Adam([self.q_tables["y"],  self.q_tables["cb"], self.q_tables["cr"]], lr= 0.01)
         
      
-    def forward(self, images, labels,alpha):
+    def forward(self, images, labels):
         r"""
         Overridden.
         """
@@ -178,14 +178,16 @@ class UniDrop(Attack):
         images = images.clone().detach().to(self.device)
         labels = labels.clone().detach().to(self.device)
         adv_loss =  nn.CrossEntropyLoss()
-        
+        self.q_tables["y"].requires_grad = True
+        self.q_tables["cb"].requires_grad = True
+        self.q_tables["cr"].requires_grad = True
         images = images.permute(0, 2, 3, 1)
         components = {'y': images[:,:,:,0], 'cb': images[:,:,:,1], 'cr': images[:,:,:,2]}
         upresults = {}
         for k in components.keys():
             comp = block_splitting(components[k])
             comp = dct_8x8(comp)
-            comp = quantize(comp, self.q_tables[k], self.alpha)
+            comp = uni_quantize(comp, self.q_tables[k], torch.exp(self.alpha))
             comp = dequantize(comp, self.q_tables[k]) 
             comp = idct_8x8(comp)
             merge_comp = block_merging(comp, self.height, self.width)
@@ -200,22 +202,48 @@ class UniDrop(Attack):
         else:
             suc_rate = ((pre != labels).sum()/self.batch_size).cpu().detach().numpy()
 
-
         adv_cost = adv_loss(outputs, labels) 
-        
+       # print(pre,labels)
         if not self.targeted:
             adv_cost = -1* adv_cost
-
         total_cost = adv_cost 
         self.optimizer.zero_grad()
         total_cost.backward()
-        self.alpha *= self.alpha_interval
-        for k in self.q_tables.keys():
-                self.q_tables[k] = self.q_tables[k].detach() -  torch.sign(self.q_tables[k].grad)
-                self.q_tables[k] = torch.clamp(self.q_tables[k], self.factor_range[0], self.factor_range[1]).detach()
+        self.alpha += self.alpha_interval
+        with torch.no_grad():
+            for k in self.q_tables.keys():
+                self.q_tables[k] = self.q_tables[k] -  torch.sign(self.q_tables[k].grad)
+                self.q_tables[k] = torch.clamp(self.q_tables[k], self.factor_range[0], self.factor_range[1])
         q_images = torch.clamp(rgb_images, min=0, max=255.0).detach()
         
         return q_images, pre, q_table
+         
+    def true_quantize(self, images):
+        r"""
+        Overridden.
+        """
+        q_table = None
+        
+
+        images = images.clone().detach().to(self.device)
+        
+        images = images.permute(0, 2, 3, 1)
+        components = {'y': images[:,:,:,0], 'cb': images[:,:,:,1], 'cr': images[:,:,:,2]}
+        upresults = {}
+        with torch.no_grad():
+            for k in components.keys():
+                comp = block_splitting(components[k])
+                comp = dct_8x8(comp)
+                comp = y_quantize(comp, self.q_tables[k])
+                comp = dequantize(comp, self.q_tables[k]) 
+                comp = idct_8x8(comp)
+                merge_comp = block_merging(comp, self.height, self.width)
+                upresults[k] = merge_comp
+            rgb_images = torch.cat([upresults['y'].unsqueeze(3), upresults['cb'].unsqueeze(3), upresults['cr'].unsqueeze(3)], dim=3)
+            rgb_images = rgb_images.permute(0, 3, 1, 2)
+            outputs = self.model(rgb_images)
+            _, pre = torch.max(outputs.data, 1)
+        return rgb_images,pre
 class Normalize(nn.Module) :
     def __init__(self, mean, std) :
         super(Normalize, self).__init__()
@@ -284,20 +312,21 @@ if __name__ == "__main__":
     normal_loader = torch.utils.data.DataLoader(normal_data, batch_size=batch_size, shuffle=False)
 
 
-    epoches=20
+    epoches=40
     num_interval=10
-    attack = UniDrop(resnet_model, batch_size=batch_size, q_size =q_size, steps=epoches*(tar_cnt//batch_size), targeted = True)    
+    attack = UniDrop(resnet_model, batch_size=batch_size, q_size =q_size, steps=epoches*(tar_cnt//batch_size), targeted = False)
+    wrong_label=  torch.Tensor([np.random.randint(0, 1000)]*batch_size).to(torch.long).to(device)
     for epoch_count in range(epoches):
         suc_cnt=0
         tot_siz=0
         normal_iter = iter(normal_loader)
-        print("Iter: ", i)
+        print("Iter: ", epoch_count)
         for i in range(tar_cnt//batch_size):
             tot_siz+=batch_size
             images, labels = normal_iter.next()  
             # For target attack: set random target. 
             # Comment if you set untargeted attack.
-            labels = torch.from_numpy(np.random.randint(0, 1000, size = batch_size))
+            #labels = wrong_label
             
             images = images * 255.0
             at_images, at_labels, suc_step = attack(images, labels)
@@ -311,10 +340,36 @@ if __name__ == "__main__":
             #save_img(adv_img, img_name, adv_dir)
 
             labels = labels.to(device)
-            suc_cnt += (at_labels == labels).sum().item()
+            suc_cnt += (at_labels != labels).sum().item()
             if i%num_interval==0:
-                print(f"Current suc. rate at epoch {epoch_count},{i}: ", suc_cnt/((i+1)*batch_size))        
-        print(f"Total suc. rate at epoch {epoch_count}: ", suc_cnt/tot_siz)
+                print(f"Current suc. rate at epoch {epoch_count},{i}: ", suc_cnt/((i+1)*batch_size))
+        print(f"Total diff suc. rate at epoch {epoch_count}: ", suc_cnt/tot_siz)
+        suc_cnt=0
+        tot_siz=0
+        normal_iter = iter(normal_loader)
+        for i in range(tar_cnt//batch_size):
+            tot_siz+=batch_size
+            images, labels = normal_iter.next()  
+            # For target attack: set random target. 
+            # Comment if you set untargeted attack.
+            #labels = wrong_label
+            
+            images = images * 255.0
+            at_images,at_labels = attack.true_quantize(images)
+
+            # Uncomment following codes if you wang to save the adv imgs
+            #at_images_np = at_images.detach().cpu().numpy() 
+            #adv_img = at_images_np[0]
+            #adv_img = np.moveaxis(adv_img, 0, 2) 
+            #adv_dir = os.path.join(save_dir, str(q_size))
+            #img_name = "adv_{}.jpg".format(i)
+            #save_img(adv_img, img_name, adv_dir)
+            labels = labels.to(device)
+            suc_cnt += (at_labels != labels).sum().item()       
+        print(f"Total true suc. rate at epoch {epoch_count}: ", suc_cnt/tot_siz)
+        print("Current Alpha:",torch.exp(attack.alpha))
+    f = open("quantizer.txt", "w")
+    print(attack.q_tables,file=f)
     score_list = np.zeros(tar_cnt)
     score_list[:suc_cnt] = 1.0
     stderr_dist = np.std(np.array(score_list))/np.sqrt(len(score_list))

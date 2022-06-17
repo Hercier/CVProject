@@ -170,6 +170,27 @@ def quantize(image, q_table,alpha):
     # image = diff_round(image)
     # after_img = diff_round(pre_img)
     return after_img
+def uni_quantize(image, q_table,alpha):
+    """[summary]
+    TODO: add disciption.
+
+    Args:
+        image ([type]): [description]
+        q_table ([type]): [description]
+    """
+    device =  torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    image = image.to(device)
+    q_table = q_table.to(device)
+    pre_img = image/(q_table)
+    after_img = phi_diff(pre_img, alpha)
+    # after_img = sgn(after_img)
+    #after_img = phi_diff(pre_img, alpha) + torch.empty_like(pre_img).uniform_(-0.5, 0.5)
+    # diff = after_img - pre_img
+    # print("Max difference: ", torch.max(diff))
+    # image = torch.round(image)
+    # image = diff_round(image)
+    # after_img = diff_round(pre_img)
+    return after_img
 
 def y_quantize(image, y_table):
     """ JPEG Quantization for Y channel
