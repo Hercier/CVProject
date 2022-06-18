@@ -45,12 +45,12 @@ class InfoDrop(Attack):
         # Value for quantization range
         self.factor_range = [5, q_size]
         # Differential quantization
-        self.alpha_range = [1e-9, 1e-20]
+        self.alpha_range = [float(np.log(1e-9)),float(np.log(1e-20))]
         self.alpha = torch.tensor(self.alpha_range[0])
         self.alpha_interval = torch.tensor((self.alpha_range[1] - self.alpha_range[0])/ self.steps)
         block_n = np.ceil(height / block_size) * np.ceil(height / block_size) 
         q_ini_table = np.empty((batch_size,int(block_n),block_size,block_size), dtype = np.float32)
-        q_ini_table.fill(q_size)
+        q_ini_table.fill(40)
         self.q_tables = {"y": torch.from_numpy(q_ini_table),
                         "cb": torch.from_numpy(q_ini_table),
                         "cr": torch.from_numpy(q_ini_table)}        
@@ -64,11 +64,10 @@ class InfoDrop(Attack):
         self.alpha = self.alpha.to(self.device)
         self.alpha_interval = self.alpha_interval.to(self.device)
 
-        images = images.clone().detach().to(self.device)
+        images = images.clone().detach().to(self.device)*255
         labels = labels.clone().detach().to(self.device)
         adv_loss =  nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam([self.q_tables["y"],  self.q_tables["cb"], self.q_tables["cr"]], lr= 0.01)
-        
         images = images.permute(0, 2, 3, 1)
         components = {'y': images[:,:,:,0], 'cb': images[:,:,:,1], 'cr': images[:,:,:,2]}
         for i in range(self.steps):
@@ -78,16 +77,16 @@ class InfoDrop(Attack):
             upresults = {}
             for k in components.keys():
                 comp = block_splitting(components[k])
-               # comp = dct_8x8(comp)
-                comp = quantize(comp, self.q_tables[k], self.alpha)
+                comp = dct_8x8(comp)
+                comp = quantize(comp, self.q_tables[k], torch.exp(self.alpha))
                 comp = dequantize(comp, self.q_tables[k]) 
-                #comp = idct_8x8(comp)
+                comp = idct_8x8(comp)
                 merge_comp = block_merging(comp, self.height, self.width)
                 upresults[k] = merge_comp
 
             rgb_images = torch.cat([upresults['y'].unsqueeze(3), upresults['cb'].unsqueeze(3), upresults['cr'].unsqueeze(3)], dim=3)
             rgb_images = rgb_images.permute(0, 3, 1, 2)
-            outputs = self.model(rgb_images)
+            outputs = self.model(rgb_images/255)
             _, pre = torch.max(outputs.data, 1)
             if self.targeted:
                 suc_rate = ((pre == labels).sum()/self.batch_size).cpu().detach().numpy()
@@ -116,10 +115,110 @@ class InfoDrop(Attack):
             if suc_rate >= 1:
                 print('End at step {} with suc. rate {}'.format(i, suc_rate))
                 q_images = torch.clamp(rgb_images, min=0, max=255.0)
-                return q_images, pre, i        
+                return q_images/255        
         q_images = torch.clamp(rgb_images, min=0, max=255.0)
        
-        return q_images, pre, q_table
+        return q_images/255
+class OriInfoDrop(Attack):
+    r"""    
+    Distance Measure : l_inf bound on quantization table
+    Arguments:
+        model (nn.Module): model to attack.
+        steps (int): number of steps. (DEFALUT: 40)
+        batch_size (int): batch size
+        q_size: bound for quantization table
+        targeted: True for targeted attack
+    Shape:
+        - images: :math:`(N, C, H, W)` where `N = number of batches`, `C = number of channels`,        `H = height` and `W = width`. It must have a range [0, 1].
+        - labels: :math:`(N)` where each value :math:`y_i` is :math:`0 \leq y_i \leq` `number of labels`.
+        - output: :math:`(N, C, H, W)`. 
+        
+    """
+    def __init__(self, model, height = 224, width = 224,  steps=40, batch_size = 20, block_size = 8, q_size = 10, targeted = False):
+        super(OriInfoDrop, self).__init__("OriInfoDrop", model)
+        self.steps = steps
+        self.targeted = targeted
+        self.batch_size = batch_size
+        self.height = height
+        self.width = width
+        # Value for quantization range
+        self.factor_range = [5, q_size]
+        # Differential quantization
+        self.alpha_range = [0.1,1e-20]
+        self.alpha = torch.tensor(self.alpha_range[0])
+        self.alpha_interval = torch.tensor((self.alpha_range[1] - self.alpha_range[0])/ self.steps)
+        block_n = np.ceil(height / block_size) * np.ceil(height / block_size) 
+        q_ini_table = np.empty((batch_size,int(block_n),block_size,block_size), dtype = np.float32)
+        q_ini_table.fill(q_size)
+        self.q_tables = {"y": torch.from_numpy(q_ini_table),
+                        "cb": torch.from_numpy(q_ini_table),
+                        "cr": torch.from_numpy(q_ini_table)}        
+    
+     
+    def forward(self, images, labels):
+        r"""
+        Overridden.
+        """
+        q_table = None
+        self.alpha = self.alpha.to(self.device)
+        self.alpha_interval = self.alpha_interval.to(self.device)
+
+        images = images.clone().detach().to(self.device)*255
+        labels = labels.clone().detach().to(self.device)
+        adv_loss =  nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam([self.q_tables["y"],  self.q_tables["cb"], self.q_tables["cr"]], lr= 0.01)
+        images = images.permute(0, 2, 3, 1)
+        components = {'y': images[:,:,:,0], 'cb': images[:,:,:,1], 'cr': images[:,:,:,2]}
+        for i in range(self.steps):
+            self.q_tables["y"].requires_grad = True
+            self.q_tables["cb"].requires_grad = True
+            self.q_tables["cr"].requires_grad = True
+            upresults = {}
+            for k in components.keys():
+                comp = block_splitting(components[k])
+                comp = dct_8x8(comp)
+                comp = quantize(comp, self.q_tables[k], self.alpha)
+                comp = dequantize(comp, self.q_tables[k]) 
+                comp = idct_8x8(comp)
+                merge_comp = block_merging(comp, self.height, self.width)
+                upresults[k] = merge_comp
+
+            rgb_images = torch.cat([upresults['y'].unsqueeze(3), upresults['cb'].unsqueeze(3), upresults['cr'].unsqueeze(3)], dim=3)
+            rgb_images = rgb_images.permute(0, 3, 1, 2)
+            outputs = self.model(rgb_images/255)
+            _, pre = torch.max(outputs.data, 1)
+            if self.targeted:
+                suc_rate = ((pre == labels).sum()/self.batch_size).cpu().detach().numpy()
+            else:
+                suc_rate = ((pre != labels).sum()/self.batch_size).cpu().detach().numpy()
+
+
+            adv_cost = adv_loss(outputs, labels) 
+            
+            if not self.targeted:
+                adv_cost = -1* adv_cost
+
+            total_cost = adv_cost 
+            optimizer.zero_grad()
+            total_cost.backward()
+
+            self.alpha += self.alpha_interval
+            
+            for k in self.q_tables.keys():
+                self.q_tables[k] = self.q_tables[k].detach() -  torch.sign(self.q_tables[k].grad)
+                self.q_tables[k] = torch.clamp(self.q_tables[k], self.factor_range[0], self.factor_range[1]).detach()
+            #print(self.q_tables)
+            if i%10 == 0:     
+            
+                print('Step: ', i, "  Loss: ", total_cost.item(), "  Current Suc rate: ", suc_rate )
+            if suc_rate >= 1:
+                print('End at step {} with suc. rate {}'.format(i, suc_rate))
+                q_images = torch.clamp(rgb_images, min=0, max=255.0)
+                return q_images/255        
+        q_images = torch.clamp(rgb_images, min=0, max=255.0)
+       
+        return q_images/255
+
 class DCTPGD(Attack):
     r"""    
     Distance Measure : l_inf bound on quantization table
@@ -196,7 +295,6 @@ class Normalize(nn.Module) :
         
     def forward(self, input):
         # Broadcasting
-        input = input/255.0
         mean = self.mean.reshape(1, 3, 1, 1)
         std = self.std.reshape(1, 3, 1, 1)
         return (input - mean) / std
@@ -222,7 +320,10 @@ def pred_label_and_confidence(model, input_batch, labels_to_class):
         pred_list.append([pred_class, pred_conf])
     return pred_list
 
-   
+def labels_from(net,images):
+    outputs = net(images)
+    _, pre = torch.max(outputs.data, 1)
+    return pre
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     class_idx = json.load(open("./imagenet_class_index.json"))
@@ -245,8 +346,8 @@ if __name__ == "__main__":
     # Uncomment if you want save results
     save_dir = "./results"
     create_dir(save_dir)
-    batch_size = 20
-    tar_cnt = 100
+    batch_size = 40
+    tar_cnt = 1000
     q_size = 40
     cur_cnt = 0
     suc_cnt = 0
@@ -257,25 +358,42 @@ if __name__ == "__main__":
 
 
     normal_iter = iter(normal_loader)
+    pgd_suc_cnt=0
+    rec_cnt=0
+    rec2_cnt=0
+    atk='AdvDrop'
+    defense='PGD'
+    defense_methods=[]
     for i in range(tar_cnt//batch_size):
         print("Iter: ", i)
         images, labels = normal_iter.next()  
         # For target attack: set random target. 
         # Comment if you set untargeted attack.
-        labels = torch.from_numpy(np.random.randint(0, 1000, size = batch_size))
-        
-        images = images * 255.0
-        attack = InfoDrop(resnet_model, batch_size=batch_size, q_size =q_size, steps=150, targeted = True)   
-        attack_compare=torchattacks.PGD(resnet_model, eps=8.0/255, alpha=2.0/255, steps=40, random_start=True)
+        #labels = torch.from_numpy(np.random.randint(0, 1000, size = batch_size))
+        labels=labels.to(device)
+        #images=images.to(device)
+        defense = InfoDrop(resnet_model, batch_size=batch_size, q_size =50, steps=50, targeted = False)
+        attack=InfoDrop(resnet_model, batch_size=batch_size, q_size =40, steps=50, targeted = False)
+        defense2=torchattacks.PGD(resnet_model, eps=4.0/255, alpha=2.0/255, steps=5, random_start=True)
         #print(attack.device) 
-        pgd_images=attack_compare(images/255,labels)*255
-        #labels=res_netmodel(labe)
-        at_images, at_labels, suc_step = attack(images, labels)
-        #print(images)
-        
+        adv_images=attack(images,labels)
+        wrong_labels=labels_from(resnet_model,adv_images)
+        #at_images, at_labels, suc_step = attack(images, labels)
+        rec_images = defense(adv_images, wrong_labels)
+        rec_labels=labels_from(resnet_model,rec_images)
+        rec2_images=defense2(adv_images,wrong_labels)
+        rec2_labels=labels_from(resnet_model,rec2_images)
+        print(labels,wrong_labels,rec_labels,rec2_labels)
+        pgd_suc_cnt+=(wrong_labels != labels).sum().item()
+        rec_cnt+=(rec_labels == labels).sum().item()
+        rec2_cnt+=(rec2_labels == labels).sum().item()
+        print("ATK suc. rate: ", pgd_suc_cnt/((i+1)*batch_size))
+        print("1 rec. rate: ", rec_cnt/((i+1)*batch_size))
+        print("2 rec. rate: ", rec2_cnt/((i+1)*batch_size))
         #print(pgd_images)
         # Uncomment following codes if you wang to save the adv imgs
         #print(images.device,at_images.device)
+        '''
         at_images = (at_images).detach().cpu() 
         res_img = (images[0]-at_images[0]).numpy()
         pgd_images = (pgd_images).detach().cpu() 
@@ -295,10 +413,10 @@ if __name__ == "__main__":
         save_img(adv_img, adv_img_name, adv_dir)
         save_img(res_img, res_img_name, adv_dir)
         save_img(res_img_pgd, res_img_pgd_name, adv_dir)
-
-        labels = labels.to(device)
-        suc_cnt += (at_labels == labels).sum().item()
-        print("Current suc. rate: ", suc_cnt/((i+1)*batch_size))
+        '''
+        #labels = labels.to(device)
+        #suc_cnt += (at_labels == labels).sum().item()
+        #print("Current suc. rate: ", suc_cnt/((i+1)*batch_size))
     score_list = np.zeros(tar_cnt)
     score_list[:suc_cnt] = 1.0
     stderr_dist = np.std(np.array(score_list))/np.sqrt(len(score_list))
